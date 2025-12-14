@@ -17,7 +17,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from .state import MMMWorkflowState, WorkflowPhase
-from .config import Settings, get_settings, create_chat_model
+from .config import Settings, get_settings, create_chat_model, get_llm_config
 from .agents import (
     PlanningAgent, planning_node,
     EDAAgent, eda_node,
@@ -27,6 +27,7 @@ from .agents import (
 from .tools.code_executor import LocalCodeExecutor
 from .tools.rag_context import ContextManager
 from .tools.web_search import ResearchTool
+
 
 logger = logging.getLogger(__name__)
 
@@ -194,58 +195,82 @@ class MMMWorkflow:
     
     def _create_planning_node(self) -> Callable:
         """Create the planning node function with injected dependencies."""
-        llm = create_chat_model(self.settings, task="reasoning")
-        agent = PlanningAgent(
-            llm=llm,
-            research_tool=self.research_tool,
-            context_manager=self.context_manager,
-        )
+        llm_config = get_llm_config(self.settings, task_type="reasoning")
+        llm = create_chat_model(llm_config)
         
         async def node(state: MMMWorkflowState) -> Dict[str, Any]:
-            return await agent.plan(state)
+            # Get context from context_manager
+            context = ""
+            if self.context_manager:
+                context = self.context_manager.get_context(
+                    state.get("workflow_id", "default"),
+                    "planning",
+                    state.get("user_query", ""),
+                )
+            
+            agent = PlanningAgent(llm=llm, research_tool=self.research_tool)
+            return await agent.plan(state, context)
         
         return node
-    
+
     def _create_eda_node(self) -> Callable:
         """Create the EDA node function with injected dependencies."""
-        llm = create_chat_model(self.settings, task="code")
-        agent = EDAAgent(
-            llm=llm,
-            code_executor=self.code_executor,
-            context_manager=self.context_manager,
-        )
+        llm_config = get_llm_config(self.settings, task_type="code")
+        llm = create_chat_model(llm_config)
         
         async def node(state: MMMWorkflowState) -> Dict[str, Any]:
-            return await agent.analyze(state)
+            context = ""
+            if self.context_manager:
+                context = self.context_manager.get_context(
+                    state.get("workflow_id", "default"),
+                    "eda",
+                    "",
+                )
+            
+            agent = EDAAgent(llm=llm, code_executor=self.code_executor)
+            return await agent.analyze(state, context)
         
         return node
-    
+
     def _create_modeling_node(self) -> Callable:
         """Create the modeling node function with injected dependencies."""
-        llm = create_chat_model(self.settings, task="code")
-        agent = ModelingAgent(
-            llm=llm,
-            code_executor=self.code_executor,
-            context_manager=self.context_manager,
-            use_bayesian=self.use_bayesian,
-        )
+        llm_config = get_llm_config(self.settings, task_type="code")
+        llm = create_chat_model(llm_config)
         
         async def node(state: MMMWorkflowState) -> Dict[str, Any]:
-            return await agent.model(state)
+            context = ""
+            if self.context_manager:
+                context = self.context_manager.get_context(
+                    state.get("workflow_id", "default"),
+                    "modeling",
+                    "",
+                )
+            
+            agent = ModelingAgent(
+                llm=llm,
+                code_executor=self.code_executor,
+                use_bayesian=self.use_bayesian,
+            )
+            return await agent.model(state, context)
         
         return node
-    
+
     def _create_interpretation_node(self) -> Callable:
         """Create the interpretation node function with injected dependencies."""
-        llm = create_chat_model(self.settings, task="reasoning")
-        agent = InterpretationAgent(
-            llm=llm,
-            code_executor=self.code_executor,
-            context_manager=self.context_manager,
-        )
+        llm_config = get_llm_config(self.settings, task_type="reasoning")
+        llm = create_chat_model(llm_config)
         
         async def node(state: MMMWorkflowState) -> Dict[str, Any]:
-            return await agent.interpret(state)
+            context = ""
+            if self.context_manager:
+                context = self.context_manager.get_context(
+                    state.get("workflow_id", "default"),
+                    "interpretation",
+                    "",
+                )
+            
+            agent = InterpretationAgent(llm=llm, code_executor=self.code_executor)
+            return await agent.interpret(state, context)
         
         return node
     
@@ -374,7 +399,7 @@ def create_workflow(
     from .config import LLMProvider
     
     settings = Settings(
-        llm_provider=LLMProvider(provider),
+        provider=LLMProvider(provider),
         default_model=model or Settings().default_model,
     )
     

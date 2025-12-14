@@ -47,8 +47,8 @@ class Settings(BaseSettings):
     
     # LLM Configuration - defaults to Ollama for local development
     default_provider: LLMProvider = LLMProvider.OLLAMA
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3.2"
+    ollama_base_url: str = "http://100.91.155.118:11434"
+    ollama_model: str = "qwen3:30b"
     
     # Optional cloud providers
     openai_api_key: str | None = None
@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     # Redis (for job queue)
     redis_url: str = "redis://localhost:6379"
     
+    provider: LLMProvider = LLMProvider.OLLAMA
+    default_model: str = "llama3.2"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
