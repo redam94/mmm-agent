@@ -1,303 +1,396 @@
-# MMM Agent POC
+# MMM Workflows
 
-**Agentic Marketing Mix Modeling Framework** - An AI-powered workflow for marketing effectiveness analysis using LangGraph, multi-LLM support, and Bayesian methods.
+AI-Powered Marketing Mix Modeling with Agentic Workflows
 
 ## Overview
 
-This proof-of-concept demonstrates an agentic approach to Marketing Mix Modeling (MMM) that combines:
+MMM Workflows is a comprehensive system for Marketing Mix Modeling (MMM) using four specialized AI agents:
 
-- **Multi-phase workflow**: Planning → EDA → Modeling → Interpretation
-- **LLM-powered analysis**: Automatic hypothesis generation, data quality assessment, and insight extraction
-- **Provider flexibility**: Works with Ollama (local), OpenAI, Anthropic, or Google Gemini
-- **Bayesian & classical methods**: Full PyMC Bayesian MMM or Ridge regression fallback
-- **Local code execution**: Safe subprocess-based code execution with AST validation
+1. **Research Agent** - Web search and planning for data collection strategy
+2. **EDA Agent** - Data quality assessment and transformation to MFF format
+3. **Modeling Agent** - Bayesian MMM fitting using PyMC-Marketing
+4. **What-If Agent** - Scenario analysis and budget optimization
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    MMM Agent Workflow                        │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌────────┐│
-│  │ Planning │───▶│   EDA    │───▶│ Modeling │───▶│Interpret││
-│  │  Agent   │    │  Agent   │    │  Agent   │    │ Agent  ││
-│  └────┬─────┘    └────┬─────┘    └────┬─────┘    └────┬───┘│
-│       │               │               │               │     │
-│       ▼               ▼               ▼               ▼     │
-│  ┌─────────────────────────────────────────────────────────┐│
-│  │              Shared State (LangGraph)                   ││
-│  │  • Research questions  • Data quality report            ││
-│  │  • Causal hypotheses   • Model diagnostics              ││
-│  │  • ROI estimates       • Budget recommendations         ││
-│  └─────────────────────────────────────────────────────────┘│
-│                                                             │
-│  ┌─────────────────────────────────────────────────────────┐│
-│  │                    Tools Layer                          ││
-│  │  • Local Code Executor   • RAG Context Manager          ││
-│  │  • Data Harmonizer       • Web Search (DuckDuckGo)      ││
-│  └─────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                        MMM Workflows API                            │
+│                       (FastAPI + WebSocket)                         │
+└─────────────────────────────────────────────────────────────────────┘
+                                   │
+        ┌──────────────────────────┼──────────────────────────┐
+        ▼                          ▼                          ▼
+┌───────────────┐        ┌─────────────────┐        ┌───────────────┐
+│   Research    │   →    │      EDA        │   →    │   Modeling    │
+│    Agent      │        │     Agent       │        │    Agent      │
+└───────────────┘        └─────────────────┘        └───────────────┘
+        │                          │                          │
+        │                          │                          ▼
+        │                          │                 ┌───────────────┐
+        │                          │                 │   What-If     │
+        │                          │                 │    Agent      │
+        │                          │                 └───────────────┘
+        │                          │                          │
+        └──────────────────────────┼──────────────────────────┘
+                                   │
+                                   ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │                    GraphRAG Layer                        │
+        │              (Neo4j + ChromaDB + PostgreSQL)             │
+        └─────────────────────────────────────────────────────────┘
 ```
+
+## Technology Stack
+
+| Component | Technology | Purpose |
+|-----------|------------|---------|
+| LLM | Ollama (qwen3:30b, qwen3-coder:30b) | Reasoning and code generation |
+| Orchestration | LangGraph | Workflow state management |
+| Graph DB | Neo4j | Knowledge graph, lineage tracking |
+| Vector DB | ChromaDB | Semantic search |
+| Checkpointing | PostgreSQL | Workflow persistence |
+| Pub/Sub | Redis | Real-time progress streaming |
+| Modeling | PyMC-Marketing | Bayesian MMM |
+| API | FastAPI | REST + WebSocket endpoints |
 
 ## Installation
 
-### Basic Installation
+### Prerequisites
 
+- Python 3.11+
+- Docker and Docker Compose
+- NVIDIA GPU (optional, for faster LLM inference)
+
+### Quick Start
+
+1. **Clone the repository**
 ```bash
-# Clone the repository
-git clone https://github.com/your-org/mmm-agent.git
-cd mmm-agent
+git clone https://github.com/your-org/mmm-workflows.git
+cd mmm-workflows
+```
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+2. **Start infrastructure services**
+```bash
+docker-compose up -d neo4j postgres redis chromadb ollama
+```
 
-# Install with pip
+3. **Pull Ollama models**
+```bash
+docker exec -it mmm-ollama ollama pull qwen3:30b
+docker exec -it mmm-ollama ollama pull qwen3-coder:30b
+```
+
+4. **Install Python dependencies**
+```bash
 pip install -e .
 ```
 
-### With Bayesian Support
-
+5. **Initialize databases**
 ```bash
-pip install -e ".[bayesian]"
+python scripts/init_db.py
 ```
 
-### Full Installation (all features)
-
+6. **Start the API**
 ```bash
-pip install -e ".[all]"
+uvicorn mmm_workflows.api.main:app --reload
 ```
 
-### LLM Provider Setup
-
-#### Ollama (Local, Free)
-```bash
-# Install Ollama: https://ollama.ai
-ollama pull llama3.1
-export OLLAMA_MODEL=llama3.1
-```
-
-#### OpenAI
-```bash
-export OPENAI_API_KEY=your-key-here
-```
-
-#### Anthropic (Claude)
-```bash
-export ANTHROPIC_API_KEY=your-key-here
-```
-
-#### Google Gemini
-```bash
-export GOOGLE_API_KEY=your-key-here
-```
-
-## Quick Start
-
-### Run Demo with Sample Data
+### Full Docker Deployment
 
 ```bash
-cd examples
-python run_demo.py
+docker-compose up -d
 ```
 
-### Interactive Mode
+Access the API at http://localhost:8000/docs
 
-```bash
-python run_demo.py --interactive
-```
+## Usage
 
-### With Your Own Data
-
-```bash
-python run_demo.py \
-    --data /path/to/your/data.csv \
-    --context "Your business context description" \
-    --provider anthropic
-```
-
-### Programmatic Usage
+### Python API
 
 ```python
 import asyncio
-from mmm_agent.workflow import create_workflow
+from mmm_workflows.workflows import (
+    create_research_workflow,
+    create_eda_workflow,
+    create_modeling_workflow,
+    create_whatif_workflow,
+)
 
-async def main():
-    workflow = create_workflow(use_bayesian=False)
-    
-    result = await workflow.run(
-        data_path="sales_data.csv",
-        business_context="""
-        E-commerce company analyzing Q4 marketing effectiveness.
-        Key channels: TV, Digital, Social, Search.
-        Primary KPI: Revenue.
-        """,
-        kpi_column="revenue",
-        media_columns=["tv_spend", "digital_spend", "social_spend", "search_spend"],
-        date_column="date",
+async def run_mmm_pipeline():
+    # Step 1: Research
+    research = await create_research_workflow()
+    research_result = await research.run(
+        "Build MMM for CPG brand with 2 years of weekly data"
     )
     
-    print(f"ROI Estimates: {result['roi_estimates']}")
-    print(f"Recommendations: {result['recommendations']}")
+    # Step 2: EDA
+    eda = await create_eda_workflow()
+    eda_result = await eda.run(
+        data_sources=["data/sales.csv"],
+        target_variable="Sales",
+        media_channels=["TV_Spend", "Digital_Spend"],
+    )
+    
+    # Step 3: Modeling
+    modeling = await create_modeling_workflow()
+    model_result = await modeling.run(
+        mff_data_path=eda_result["mff_data_path"],
+        research_plan=research_result["research_plan"],
+    )
+    
+    # Step 4: What-If Analysis
+    whatif = await create_whatif_workflow()
+    whatif_result = await whatif.run(
+        model_artifact_path=model_result["model_artifact_path"],
+        mff_data_path=eda_result["mff_data_path"],
+        user_query="What if we increase TV spend by 20%?",
+    )
+    
+    return whatif_result
 
-asyncio.run(main())
+asyncio.run(run_mmm_pipeline())
 ```
 
-## Workflow Phases
+### REST API
 
-### 1. Planning Phase
-- Analyzes business context and data structure
-- Generates research questions
-- Forms causal hypotheses (treatment → outcome with mechanisms)
-- Identifies potential confounders
-- Optional web research for domain context
+```bash
+# Start research workflow
+curl -X POST http://localhost:8000/research/start \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Build MMM for beverage brand"}'
 
-### 2. EDA Phase
-- Loads and profiles data
-- Checks data quality (missing values, outliers, date gaps)
-- Generates visualizations (time series, correlations, distributions)
-- Recommends feature transformations
+# Check status
+curl http://localhost:8000/workflow/{workflow_id}
 
-### 3. Modeling Phase
-- Builds model specification (adstock, saturation, controls)
-- Fits Bayesian MMM (PyMC) or Ridge regression fallback
-- Calculates convergence diagnostics
-- Estimates channel contributions
+# Upload data
+curl -X POST http://localhost:8000/upload \
+  -F "file=@data/sales.csv"
 
-### 4. Interpretation Phase
-- Calculates ROI by channel
-- Optimizes budget allocation
-- Runs what-if scenarios
-- Generates actionable recommendations
+# Start EDA
+curl -X POST http://localhost:8000/eda/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "data_sources": ["/path/to/uploaded/file.csv"],
+    "target_variable": "Sales",
+    "media_channels": ["TV_Spend", "Digital_Spend"]
+  }'
+```
+
+### WebSocket (Real-time Updates)
+
+```javascript
+const ws = new WebSocket('ws://localhost:8000/ws/{workflow_id}');
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log('Status:', data.data.status);
+  console.log('Progress:', data.data.progress);
+};
+```
+
+## Workflows
+
+### 1. Research Agent
+
+**Purpose**: Conducts web research and creates a structured research plan.
+
+**Inputs**:
+- User query describing the MMM objective
+
+**Outputs**:
+- Research plan with target variable, channels, controls
+- Causal hypotheses
+- Data requirements
+
+**Phases**:
+1. Initialize analysis
+2. Conduct web search (DuckDuckGo + crawl4ai)
+3. Generate research plan
+4. Collect user feedback (optional)
+5. Finalize
+
+### 2. EDA Agent
+
+**Purpose**: Cleans data and transforms to Marketing Measurement Framework (MFF) format.
+
+**Inputs**:
+- Data file paths
+- Target variable name
+- Media channel columns
+
+**Outputs**:
+- MFF-formatted data
+- Quality report
+- EDA visualizations
+- Modeling recommendations
+
+**Phases**:
+1. Load and merge data
+2. Run quality checks
+3. Generate EDA analysis
+4. Transform to MFF format
+5. Finalize with recommendations
+
+### 3. Modeling Agent
+
+**Purpose**: Fits Bayesian MMM and extracts insights.
+
+**Inputs**:
+- MFF data path
+- Research plan (optional)
+- Feature transformations (optional)
+
+**Outputs**:
+- Fitted model artifact
+- Channel contributions
+- ROI estimates
+- Convergence diagnostics
+- Interpretation summary
+
+**Phases**:
+1. Initialize and configure
+2. Generate model configuration
+3. Fit Bayesian MMM
+4. Run diagnostics
+5. Interpret results
+
+### 4. What-If Agent
+
+**Purpose**: Scenario analysis and budget optimization.
+
+**Inputs**:
+- Model artifact path
+- MFF data path
+- Scenario query (natural language)
+
+**Outputs**:
+- Scenario comparison results
+- Optimization recommendations
+- Sensitivity analysis
+- Summary with actionable insights
+
+**Phases**:
+1. Load model artifacts
+2. Parse scenario queries
+3. Run scenario analysis
+4. Generate optimization suggestions
+5. Create summary
 
 ## Configuration
 
-### Environment Variables
+Environment variables:
 
 ```bash
-# LLM Provider (ollama, openai, anthropic, gemini)
-LLM_PROVIDER=ollama
-OLLAMA_MODEL=llama3.1
+# Ollama
 OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_REASONING_MODEL=qwen3:30b
+OLLAMA_CODING_MODEL=qwen3-coder:30b
 
-# OpenAI
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o
+# Neo4j
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=password
 
-# Anthropic
-ANTHROPIC_API_KEY=sk-ant-...
-ANTHROPIC_MODEL=claude-sonnet-4-20250514
+# PostgreSQL
+DATABASE_URL=postgresql://user:pass@localhost:5432/mmm
+ASYNC_DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/mmm
 
-# Google
-GOOGLE_API_KEY=...
-GOOGLE_MODEL=gemini-1.5-pro
+# Redis
+REDIS_URL=redis://localhost:6379
 
-# Workflow
-CODE_TIMEOUT=120
-MAX_RETRIES=3
+# Storage
+UPLOAD_DIR=/data/uploads
+MODEL_DIR=/data/models
+OUTPUT_DIR=/data/outputs
 ```
-
-### Data Format
-
-The agent accepts CSV, Excel, or Parquet files with:
-
-| Column Type | Description | Example |
-|------------|-------------|---------|
-| Date | Time dimension | `date`, `week`, `period` |
-| KPI | Target variable | `revenue`, `sales`, `conversions` |
-| Media | Marketing spend | `tv_spend`, `digital_spend` |
-| Control | External factors | `price`, `promo`, `weather` |
-| Geography | Optional dimension | `region`, `market` |
-| Product | Optional dimension | `brand`, `sku` |
 
 ## Project Structure
 
 ```
-mmm_agent_poc/
-├── src/mmm_agent/
-│   ├── __init__.py
-│   ├── config.py          # LLM provider configuration
-│   ├── state.py           # LangGraph state schema
-│   ├── workflow.py        # Main workflow orchestration
-│   ├── agents/
-│   │   ├── planning.py    # Planning phase agent
-│   │   ├── eda.py         # EDA phase agent
-│   │   ├── modeling.py    # Modeling phase agent
-│   │   └── interpretation.py  # Interpretation agent
-│   ├── tools/
-│   │   ├── code_executor.py   # Local code execution
-│   │   ├── data_harmonizer.py # Multi-source data alignment
-│   │   ├── rag_context.py     # RAG context manager
-│   │   └── web_search.py      # Web search integration
-│   └── data/
-│       └── sample_generator.py # Sample data generation
+mmm-workflows/
+├── src/
+│   └── mmm_workflows/
+│       ├── __init__.py
+│       ├── config.py              # Settings and LLM configuration
+│       ├── api/
+│       │   ├── __init__.py
+│       │   └── main.py            # FastAPI application
+│       ├── db/
+│       │   ├── __init__.py
+│       │   ├── neo4j_client.py    # Neo4j graph operations
+│       │   └── graphrag.py        # Combined graph + vector retrieval
+│       ├── tools/
+│       │   ├── __init__.py
+│       │   ├── web_search.py      # DuckDuckGo + crawl4ai
+│       │   └── code_executor.py   # Sandboxed Python execution
+│       └── workflows/
+│           ├── __init__.py
+│           ├── state.py           # LangGraph state definitions
+│           ├── research_agent.py  # Workflow 1
+│           ├── eda_agent.py       # Workflow 2
+│           ├── modeling_agent.py  # Workflow 3
+│           └── whatif_agent.py    # Workflow 4
+├── scripts/
+│   └── init_db.py                 # Database initialization
 ├── examples/
-│   └── run_demo.py        # Demo script
-├── tests/
-│   └── test_workflow.py   # Test suite
-├── pyproject.toml         # Project configuration
+│   └── full_workflow_example.py   # Usage examples
+├── docker-compose.yml
+├── Dockerfile
+├── pyproject.toml
 └── README.md
 ```
 
-## Key Design Decisions
+## GraphRAG Knowledge Persistence
 
-### Local Code Executor
-- Uses subprocess isolation instead of E2B for POC simplicity
-- AST validation blocks dangerous operations (subprocess, socket, shutil)
-- Automatic matplotlib Agg backend injection for headless execution
+The system uses a hybrid GraphRAG approach:
 
-### Multi-LLM Support
-- Uses LangChain's `init_chat_model()` for runtime provider switching
-- Task-based routing (reasoning → Claude, code → GPT-4o, fast → Ollama)
-- Graceful fallback when providers unavailable
+- **Neo4j**: Stores entities (Variables, Analyses, Decisions, Models) and relationships
+- **ChromaDB**: Stores document embeddings for semantic search
+- **PostgreSQL**: Stores LangGraph checkpoints for workflow resumability
 
-### Ridge Regression Fallback
-- Full Bayesian MMM requires PyMC which can be complex to install
-- Ridge regression provides channel contributions without uncertainty
-- `use_bayesian=False` (default) for reliable demos
+### Knowledge Flow
 
-## Extending the Framework
+1. **Research Agent** stores:
+   - Web search results with sources
+   - Research synthesis
+   - Planning decisions
 
-### Adding a New Phase
+2. **EDA Agent** stores:
+   - Data quality decisions
+   - Feature transformation rationale
+   - MFF generation metadata
 
-```python
-from mmm_agent.state import MMMWorkflowState
+3. **Modeling Agent** stores:
+   - Model configuration rationale
+   - Convergence decisions
+   - Interpretation insights
 
-async def my_custom_node(state: MMMWorkflowState) -> dict:
-    # Access previous phase results
-    roi = state.get("roi_estimates", {})
-    
-    # Do custom analysis
-    results = analyze(roi)
-    
-    # Return state updates
-    return {
-        "custom_results": results,
-        "messages": ["Custom analysis complete"],
-    }
+4. **What-If Agent** retrieves:
+   - Prior successful patterns
+   - Similar scenarios
+   - Optimization best practices
+
+## Development
+
+### Running Tests
+
+```bash
+pytest tests/ -v
 ```
 
-### Custom Tools
+### Code Formatting
 
-```python
-from langchain_core.tools import tool
-
-@tool
-def my_custom_tool(query: str) -> str:
-    """Description of what this tool does."""
-    return perform_custom_operation(query)
+```bash
+black src/
+isort src/
 ```
 
-## Production Roadmap
+### Type Checking
 
-This POC demonstrates the core concepts. For production:
-
-1. **Replace RAG**: Use ChromaDB or Neo4j for vector/graph storage
-2. **Distributed Fitting**: Integrate Ray for parallel model fitting
-3. **Full Bayesian**: Use PyMC-Marketing for hierarchical models
-4. **API Layer**: Add FastAPI endpoints for async execution
-5. **Monitoring**: Add observability with LangSmith or similar
+```bash
+mypy src/
+```
 
 ## License
 
@@ -305,4 +398,15 @@ MIT License - see LICENSE file for details.
 
 ## Contributing
 
-Contributions welcome! Please read CONTRIBUTING.md for guidelines.
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Run tests
+5. Submit a pull request
+
+## References
+
+- [PyMC-Marketing](https://www.pymc-marketing.io/)
+- [LangGraph](https://langchain-ai.github.io/langgraph/)
+- [Neo4j](https://neo4j.com/)
+- [Ollama](https://ollama.ai/)

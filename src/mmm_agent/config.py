@@ -1,234 +1,241 @@
 """
-MMM Agent Configuration
+MMM Workflows Configuration
 
-Provider-agnostic LLM configuration supporting Ollama, OpenAI, Anthropic, and Gemini.
+Centralized configuration for all four workflows using:
+- Ollama with qwen3:30b / qwen3-coder:30b
+- Neo4j for graph storage
+- PostgreSQL for checkpointing
+- Redis for pub/sub
 """
 
 from __future__ import annotations
 
-import os
 from enum import Enum
-from typing import Any, Literal
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
-class LLMProvider(str, Enum):
-    """Supported LLM providers."""
-    OLLAMA = "ollama"
-    OPENAI = "openai"
-    ANTHROPIC = "anthropic"
-    GEMINI = "google_genai"
-
-
-class LLMConfig(BaseModel):
-    """Configuration for a specific LLM."""
-    provider: LLMProvider
-    model: str
-    temperature: float = 0.0
-    max_tokens: int = 4096
-    base_url: str | None = None  # For Ollama
-    api_key: str | None = None
+class LLMTask(str, Enum):
+    """Task types for LLM model selection."""
+    REASONING = "reasoning"
+    CODE = "code"
+    PLANNING = "planning"
+    ANALYSIS = "analysis"
 
 
 class Settings(BaseSettings):
-    """Application settings."""
+    """Application settings loaded from environment."""
     
-    # App settings
-    app_name: str = "MMM Agent POC"
-    app_version: str = "0.1.0"
-    debug: bool = True
+    # ==========================================================================
+    # Ollama Configuration
+    # ==========================================================================
+    ollama_base_url: str = Field(
+        default="http://localhost:11434",
+        description="Ollama server URL"
+    )
+    ollama_reasoning_model: str = Field(
+        default="qwen3:30b",
+        description="Model for reasoning/planning tasks"
+    )
+    ollama_code_model: str = Field(
+        default="qwen3-coder:30b", 
+        description="Model for code generation tasks"
+    )
+    ollama_timeout: int = Field(
+        default=600,
+        description="Timeout for Ollama requests in seconds"
+    )
     
-    # Storage
-    data_dir: str = "./data"
-    models_dir: str = "./models"
-    outputs_dir: str = "./outputs"
+    # ==========================================================================
+    # Neo4j Configuration
+    # ==========================================================================
+    neo4j_uri: str = Field(
+        default="bolt://localhost:7687",
+        description="Neo4j connection URI"
+    )
+    neo4j_user: str = Field(
+        default="neo4j",
+        description="Neo4j username"
+    )
+    neo4j_password: str = Field(
+        default="password",
+        description="Neo4j password"
+    )
+    neo4j_database: str = Field(
+        default="mmm",
+        description="Neo4j database name"
+    )
     
-    # LLM Configuration - defaults to Ollama for local development
-    default_provider: LLMProvider = LLMProvider.OLLAMA
-    ollama_base_url: str = "http://100.91.155.118:11434"
-    ollama_model: str = "qwen3:30b"
+    # ==========================================================================
+    # PostgreSQL Configuration
+    # ==========================================================================
+    postgres_host: str = Field(default="localhost")
+    postgres_port: int = Field(default=5432)
+    postgres_user: str = Field(default="mmm")
+    postgres_password: str = Field(default="mmm_password")
+    postgres_database: str = Field(default="mmm_workflows")
     
-    # Optional cloud providers
-    openai_api_key: str | None = None
-    openai_model: str = "gpt-4o"
-    
-    anthropic_api_key: str | None = None
-    anthropic_model: str = "claude-sonnet-4-5-20250929"
-    
-    google_api_key: str | None = None
-    google_model: str = "gemini-1.5-pro"
-    
-    # Code execution
-    code_timeout: int = 300
-    max_retries: int = 3
-    
-    # RAG settings
-    rag_persist_dir: str = "./rag_store"
-    rag_chunk_size: int = 1000
-    rag_chunk_overlap: int = 200
-    
-    # Redis (for job queue)
-    redis_url: str = "redis://localhost:6379"
-    
-    provider: LLMProvider = LLMProvider.OLLAMA
-    default_model: str = "llama3.2"
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
-
-def get_settings() -> Settings:
-    """Get application settings."""
-    return Settings()
-
-
-def get_llm_config(
-    settings: Settings,
-    provider: LLMProvider | None = None,
-    task_type: Literal["reasoning", "code", "structured", "fast"] = "reasoning"
-) -> LLMConfig:
-    """
-    Get LLM configuration based on provider and task type.
-    
-    Task types:
-    - reasoning: Complex causal reasoning (use Claude)
-    - code: Code generation (use GPT-4o or local)
-    - structured: Structured outputs (use GPT-4o)
-    - fast: Quick responses (use local Ollama or GPT-4o-mini)
-    """
-    provider = provider or settings.default_provider
-    
-    # Task-based routing
-    if task_type == "reasoning" and settings.anthropic_api_key:
-        return LLMConfig(
-            provider=LLMProvider.ANTHROPIC,
-            model=settings.anthropic_model,
-            temperature=0.0,
-            api_key=settings.anthropic_api_key,
-        )
-    elif task_type == "structured" and settings.openai_api_key:
-        return LLMConfig(
-            provider=LLMProvider.OPENAI,
-            model=settings.openai_model,
-            temperature=0.0,
-            api_key=settings.openai_api_key,
-        )
-    elif task_type == "fast":
-        return LLMConfig(
-            provider=LLMProvider.OLLAMA,
-            model=settings.ollama_model,
-            temperature=0.0,
-            base_url=settings.ollama_base_url,
+    @property
+    def postgres_url(self) -> str:
+        """Get PostgreSQL connection URL."""
+        return (
+            f"postgresql://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_database}"
         )
     
-    # Default to configured provider
-    if provider == LLMProvider.OLLAMA:
-        return LLMConfig(
-            provider=LLMProvider.OLLAMA,
-            model=settings.ollama_model,
-            base_url=settings.ollama_base_url,
-        )
-    elif provider == LLMProvider.OPENAI:
-        return LLMConfig(
-            provider=LLMProvider.OPENAI,
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-        )
-    elif provider == LLMProvider.ANTHROPIC:
-        return LLMConfig(
-            provider=LLMProvider.ANTHROPIC,
-            model=settings.anthropic_model,
-            api_key=settings.anthropic_api_key,
-        )
-    elif provider == LLMProvider.GEMINI:
-        return LLMConfig(
-            provider=LLMProvider.GEMINI,
-            model=settings.google_model,
-            api_key=settings.google_api_key,
+    @property
+    def postgres_async_url(self) -> str:
+        """Get async PostgreSQL connection URL."""
+        return (
+            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_database}"
         )
     
-    raise ValueError(f"Unknown provider: {provider}")
-
-
-def create_chat_model(config: LLMConfig):
-    """
-    Create a LangChain chat model from configuration.
+    # ==========================================================================
+    # Redis Configuration
+    # ==========================================================================
+    redis_host: str = Field(default="localhost")
+    redis_port: int = Field(default=6379)
+    redis_password: str | None = Field(default=None)
     
-    Uses init_chat_model for provider-agnostic instantiation.
-    """
-    from langchain.chat_models import init_chat_model
+    @property
+    def redis_url(self) -> str:
+        """Get Redis connection URL."""
+        if self.redis_password:
+            return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}"
+        return f"redis://{self.redis_host}:{self.redis_port}"
     
-    kwargs = {
-        "model": config.model,
-        "model_provider": config.provider.value,
-        "temperature": config.temperature,
+    # ==========================================================================
+    # ChromaDB / Vector Store
+    # ==========================================================================
+    chroma_persist_dir: str = Field(
+        default="./data/chroma",
+        description="ChromaDB persistence directory"
+    )
+    embedding_model: str = Field(
+        default="all-MiniLM-L6-v2",
+        description="Sentence transformer model for embeddings"
+    )
+    
+    # ==========================================================================
+    # Storage Paths
+    # ==========================================================================
+    data_dir: Path = Field(default=Path("./data"))
+    uploads_dir: Path = Field(default=Path("./data/uploads"))
+    models_dir: Path = Field(default=Path("./data/models"))
+    outputs_dir: Path = Field(default=Path("./data/outputs"))
+    
+    # ==========================================================================
+    # API Configuration
+    # ==========================================================================
+    api_host: str = Field(default="0.0.0.0")
+    api_port: int = Field(default=8000)
+    cors_origins: list[str] = Field(
+        default=["http://localhost:3000", "http://localhost:5173"]
+    )
+    
+    # ==========================================================================
+    # Code Execution
+    # ==========================================================================
+    code_execution_timeout: int = Field(
+        default=300,
+        description="Timeout for code execution in seconds"
+    )
+    code_working_dir: Path = Field(
+        default=Path("./data/sandbox"),
+        description="Working directory for code execution"
+    )
+    
+    model_config = {
+        "env_file": ".env",
+        "env_prefix": "MMM_",
+        "extra": "ignore",
     }
     
-    if config.base_url:
-        kwargs["base_url"] = config.base_url
-    if config.api_key:
-        kwargs["api_key"] = config.api_key
+    def ensure_dirs(self):
+        """Create required directories."""
+        for dir_path in [
+            self.data_dir,
+            self.uploads_dir,
+            self.models_dir,
+            self.outputs_dir,
+            self.code_working_dir,
+            Path(self.chroma_persist_dir),
+        ]:
+            dir_path.mkdir(parents=True, exist_ok=True)
     
-    return init_chat_model(**kwargs)
+    def get_model_for_task(self, task: LLMTask | str) -> str:
+        """Get the appropriate model for a task type."""
+        task = LLMTask(task) if isinstance(task, str) else task
+        
+        if task in [LLMTask.CODE, LLMTask.ANALYSIS]:
+            return self.ollama_code_model
+        return self.ollama_reasoning_model
 
 
-class MFFDimensions(BaseModel):
-    """Standard MFF dimensions for data alignment."""
-    period_column: str = "Period"
-    geography_column: str | None = "Geography"
-    product_column: str | None = "Product"
-    variable_column: str = "Variable"
-    value_column: str = "Value"
-    
-    # Date format for period parsing
-    date_format: str = "%Y-%m-%d"
-    frequency: Literal["D", "W", "M"] = "W"
+@lru_cache
+def get_settings() -> Settings:
+    """Get cached settings instance."""
+    settings = Settings()
+    settings.ensure_dirs()
+    return settings
 
 
-class DataSourceConfig(BaseModel):
-    """Configuration for a data source."""
-    name: str
-    path: str
-    source_type: Literal["csv", "excel", "parquet", "json"] = "csv"
+# =============================================================================
+# LLM Factory
+# =============================================================================
+
+def create_ollama_llm(
+    task: LLMTask | str = LLMTask.REASONING,
+    temperature: float = 0.0,
+    settings: Settings | None = None,
+):
+    """
+    Create an Ollama LLM instance for the given task.
     
-    # Column mappings to standard MFF dimensions
-    period_column: str
-    geography_column: str | None = None
-    product_column: str | None = None
+    Args:
+        task: Task type to select model
+        temperature: Model temperature
+        settings: Optional settings override
     
-    # Variable columns (will be melted)
-    variable_columns: list[str] = Field(default_factory=list)
+    Returns:
+        ChatOllama instance
+    """
+    from langchain_ollama import ChatOllama
     
-    # Value scaling/transformation
-    value_scale: float = 1.0
+    settings = settings or get_settings()
+    model = settings.get_model_for_task(task)
     
-    # Date parsing
-    date_format: str = "%Y-%m-%d"
-    
-    # Metadata
-    data_domain: Literal["media", "sales", "control", "external"] = "media"
+    return ChatOllama(
+        model=model,
+        base_url=settings.ollama_base_url,
+        temperature=temperature,
+        num_ctx=32768,  # Large context window
+        timeout=settings.ollama_timeout,
+    )
 
 
-class WorkflowConfig(BaseModel):
-    """Configuration for the MMM workflow."""
-    workflow_id: str
-    name: str = "MMM Analysis"
+def create_structured_llm(
+    output_schema,
+    task: LLMTask | str = LLMTask.REASONING,
+    settings: Settings | None = None,
+):
+    """
+    Create an Ollama LLM with structured output.
     
-    # Data sources
-    data_sources: list[DataSourceConfig] = Field(default_factory=list)
+    Args:
+        output_schema: Pydantic model for output
+        task: Task type to select model
+        settings: Optional settings override
     
-    # MFF configuration
-    mff_dimensions: MFFDimensions = Field(default_factory=MFFDimensions)
-    
-    # Model settings
-    kpi_variable: str = "Revenue"
-    media_channels: list[str] = Field(default_factory=list)
-    control_variables: list[str] = Field(default_factory=list)
-    
-    # Fitting parameters
-    n_chains: int = 4
-    n_draws: int = 1000
-    n_tune: int = 500
+    Returns:
+        LLM with structured output
+    """
+    llm = create_ollama_llm(task=task, temperature=0, settings=settings)
+    return llm.with_structured_output(output_schema)
+
+settings = get_settings()

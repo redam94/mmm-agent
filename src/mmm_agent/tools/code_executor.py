@@ -1,15 +1,15 @@
 """
-Local Code Executor for MMM Agent
+Code Executor for MMM Workflows
 
 Executes Python code in a sandboxed subprocess environment.
-Adapted from the variable-importance repository.
+Based on the variable_importance repository patterns.
 
 Features:
-- Executes Python code in subprocess
-- Captures stdout, stderr
-- Tracks generated files (plots, data, models)
-- AST-based code validation for safety
+- Subprocess-based isolation
+- AST validation for security
+- File tracking for generated outputs
 - Timeout handling
+- Session-based working directories
 """
 
 from __future__ import annotations
@@ -17,24 +17,28 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from loguru import logger
+
+from ..config import Settings, get_settings
 
 
 # =============================================================================
 # Code Validation
 # =============================================================================
 
-# Modules blocked for security
+# Blocked modules for security
 BLOCKED_MODULES = {
     "subprocess", "socket", "shutil", "ftplib", "telnetlib",
-    "smtplib", "http.server", "socketserver", "multiprocessing"
+    "smtplib", "http.server", "socketserver", "multiprocessing",
+    "os.system", "pty", "fcntl", "grp", "pwd", "crypt",
 }
 
 # Allowed modules for MMM analysis
@@ -42,7 +46,8 @@ ALLOWED_MODULES = {
     "pandas", "numpy", "matplotlib", "seaborn", "scipy", "statsmodels",
     "sklearn", "pymc", "arviz", "xarray", "json", "csv", "pickle",
     "datetime", "pathlib", "os.path", "warnings", "typing", "functools",
-    "itertools", "collections", "math", "re", "io",
+    "itertools", "collections", "math", "re", "io", "hashlib",
+    "pymc_marketing", "numpyro", "jax", "cloudpickle", "tqdm",
 }
 
 
@@ -71,55 +76,22 @@ def validate_code(code: str) -> tuple[bool, str]:
                 if module in BLOCKED_MODULES:
                     return False, f"Blocked module: {module}"
         
-        # Block exec/eval with dynamic strings
+        # Block dangerous built-in calls
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
-                if node.func.id in ("exec", "eval", "compile"):
-                    # Check if argument is a literal string (safer)
-                    if node.args and not isinstance(node.args[0], ast.Constant):
-                        return False, f"Dynamic {node.func.id}() not allowed"
+                if node.func.id in ("exec", "eval", "compile", "open"):
+                    # Allow open for reading files
+                    if node.func.id == "open":
+                        continue
+                    return False, f"Blocked function: {node.func.id}"
+            elif isinstance(node.func, ast.Attribute):
+                # Block os.system, os.popen, etc.
+                if isinstance(node.func.value, ast.Name):
+                    if node.func.value.id == "os":
+                        if node.func.attr in ("system", "popen", "spawn", "fork"):
+                            return False, f"Blocked: os.{node.func.attr}"
     
-    return True, "Valid"
-
-
-# =============================================================================
-# Matplotlib Setup Code
-# =============================================================================
-
-MATPLOTLIB_SETUP = '''
-# === Auto-injected setup ===
-import warnings
-warnings.filterwarnings('ignore')
-
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
-# Set default style
-plt.style.use('seaborn-v0_8-whitegrid')
-plt.rcParams['figure.figsize'] = (10, 6)
-plt.rcParams['figure.dpi'] = 150
-plt.rcParams['savefig.dpi'] = 300
-plt.rcParams['savefig.bbox'] = 'tight'
-plt.rcParams['font.size'] = 10
-
-# Working directory for outputs
-import os
-WORKING_DIR = "{working_dir}"
-os.chdir(WORKING_DIR)
-
-def save_figure(name: str, fig=None):
-    """Save current figure with standardized naming."""
-    if fig is None:
-        fig = plt.gcf()
-    path = os.path.join(WORKING_DIR, f"{{name}}.png")
-    fig.savefig(path, dpi=300, bbox_inches='tight')
-    print(f"Saved plot: {{name}}.png")
-    return path
-
-# === End setup ===
-
-'''
+    return True, "Code validated successfully"
 
 
 # =============================================================================
@@ -128,24 +100,27 @@ def save_figure(name: str, fig=None):
 
 @dataclass
 class ExecutionResult:
-    """Result of code execution."""
+    """Result from code execution."""
     success: bool
-    stdout: str
-    stderr: str
-    error: str | None
-    execution_time_seconds: float
+    stdout: str = ""
+    stderr: str = ""
+    return_value: Any = None
+    error: str | None = None
+    execution_time: float = 0.0
     generated_files: list[str] = field(default_factory=list)
-    working_dir: str = ""
+    plots: list[str] = field(default_factory=list)
     
     def to_dict(self) -> dict:
+        """Convert to dictionary."""
         return {
             "success": self.success,
             "stdout": self.stdout,
             "stderr": self.stderr,
+            "return_value": str(self.return_value) if self.return_value else None,
             "error": self.error,
-            "execution_time_seconds": self.execution_time_seconds,
+            "execution_time": self.execution_time,
             "generated_files": self.generated_files,
-            "working_dir": self.working_dir,
+            "plots": self.plots,
         }
 
 
@@ -153,99 +128,221 @@ class ExecutionResult:
 # Code Executor
 # =============================================================================
 
-class LocalCodeExecutor:
+class CodeExecutor:
     """
-    Execute Python code in a sandboxed subprocess.
+    Execute Python code in isolated subprocess.
     
     Features:
-    - Subprocess isolation
-    - Output capture
+    - Session-based working directories
     - File tracking
     - Timeout handling
-    - Input data passing via pickle
+    - Output capture
     """
     
     def __init__(
         self,
         timeout_seconds: int = 300,
-        max_output_lines: int = 1000,
         working_dir: Path | None = None,
+        settings: Settings | None = None,
     ):
-        self.timeout_seconds = timeout_seconds
-        self.max_output_lines = max_output_lines
-        self.base_working_dir = working_dir or Path(tempfile.gettempdir()) / "mmm_agent"
-        self.base_working_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"LocalCodeExecutor initialized (timeout={timeout_seconds}s)")
+        self.settings = settings or get_settings()
+        self.timeout = timeout_seconds
+        self.base_dir = working_dir or self.settings.code_working_dir
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        
+        self._sessions: dict[str, Path] = {}
     
-    def _get_working_dir(self, session_id: str) -> Path:
-        """Get or create working directory for a session."""
-        work_dir = self.base_working_dir / session_id
-        work_dir.mkdir(parents=True, exist_ok=True)
-        return work_dir
+    def _get_session_dir(self, session_id: str) -> Path:
+        """Get or create session working directory."""
+        if session_id not in self._sessions:
+            session_dir = self.base_dir / session_id
+            session_dir.mkdir(parents=True, exist_ok=True)
+            self._sessions[session_id] = session_dir
+        return self._sessions[session_id]
     
-    def _prepare_code(
+    def _generate_wrapper_code(
         self,
         code: str,
-        working_dir: Path,
-        input_data: dict[str, Any] | None = None,
+        session_dir: Path,
+        input_data: dict | None = None,
     ) -> str:
-        """Prepare code with setup and optional input data loading."""
-        prepared = MATPLOTLIB_SETUP.format(working_dir=str(working_dir))
-        
-        # Add input data loading if provided
-        if input_data:
-            import pickle
-            data_file = working_dir / "_input_data.pkl"
-            with open(data_file, 'wb') as f:
-                pickle.dump(input_data, f)
-            
-            prepared += f'''
-# === Load input data ===
-import pickle
-with open("{data_file}", 'rb') as f:
-    __INPUT__ = pickle.load(f)
-# Unpack to global scope
-for __k, __v in __INPUT__.items():
-    globals()[__k] = __v
-print(f"Loaded input data: {{list(__INPUT__.keys())}}")
-# === End input data ===
+        """Generate wrapper code with setup and teardown."""
+        wrapper = f'''
+import sys
+import os
+import json
+import warnings
+warnings.filterwarnings('ignore')
 
+# Set working directory
+os.chdir("{session_dir}")
+
+# Import common libraries
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Input data (if provided)
+_INPUT_DATA = {json.dumps(input_data) if input_data else "{}"}
+
+# Track generated files
+_GENERATED_FILES = []
+_ORIGINAL_SAVEFIG = plt.savefig
+
+def _tracked_savefig(*args, **kwargs):
+    """Track saved figures."""
+    if args:
+        _GENERATED_FILES.append(str(args[0]))
+    return _ORIGINAL_SAVEFIG(*args, **kwargs)
+
+plt.savefig = _tracked_savefig
+
+# Helper functions
+def load_input_data():
+    """Load input data passed to this execution."""
+    return _INPUT_DATA
+
+def save_output(data, filename="output.json"):
+    """Save output data as JSON."""
+    with open(filename, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+    _GENERATED_FILES.append(filename)
+    return filename
+
+def list_files(pattern="*"):
+    """List files in working directory."""
+    from pathlib import Path
+    return list(Path(".").glob(pattern))
+
+# ============ USER CODE ============
+try:
+{_indent_code(code)}
+except Exception as e:
+    print(f"Error: {{e}}", file=sys.stderr)
+    raise
+
+# ============ END USER CODE ============
+
+# Report generated files
+print(f"\\n__GENERATED_FILES__: {{json.dumps(_GENERATED_FILES)}}")
 '''
-        
-        prepared += code
-        return prepared
+        return wrapper
+
+
+def _indent_code(code: str, spaces: int = 4) -> str:
+    """Indent code block."""
+    indent = " " * spaces
+    return "\n".join(indent + line for line in code.split("\n"))
+
+
+class CodeExecutor:
+    """
+    Execute Python code in isolated subprocess.
+    """
     
-    def _truncate_output(self, text: str) -> str:
-        """Truncate output if too long."""
-        lines = text.split('\n')
-        if len(lines) > self.max_output_lines:
-            kept = lines[:self.max_output_lines]
-            return '\n'.join(kept) + f"\n\n[... truncated {len(lines) - self.max_output_lines} lines ...]"
-        return text
+    def __init__(
+        self,
+        timeout_seconds: int = 300,
+        working_dir: Path | None = None,
+        settings: Settings | None = None,
+    ):
+        self.settings = settings or get_settings()
+        self.timeout = timeout_seconds
+        self.base_dir = working_dir or self.settings.code_working_dir
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._sessions: dict[str, Path] = {}
+    
+    def _get_session_dir(self, session_id: str) -> Path:
+        """Get or create session working directory."""
+        if session_id not in self._sessions:
+            session_dir = self.base_dir / session_id
+            session_dir.mkdir(parents=True, exist_ok=True)
+            self._sessions[session_id] = session_dir
+        return self._sessions[session_id]
+    
+    def _generate_wrapper_code(
+        self,
+        code: str,
+        session_dir: Path,
+        input_data: dict | None = None,
+    ) -> str:
+        """Generate wrapper code with setup and teardown."""
+        indent = "    "
+        indented_code = "\n".join(indent + line for line in code.split("\n"))
+        
+        wrapper = f'''
+import sys
+import os
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+os.chdir("{session_dir}")
+
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+_INPUT_DATA = {json.dumps(input_data) if input_data else "{}"}
+_GENERATED_FILES = []
+_ORIGINAL_SAVEFIG = plt.savefig
+
+def _tracked_savefig(*args, **kwargs):
+    if args:
+        _GENERATED_FILES.append(str(args[0]))
+    return _ORIGINAL_SAVEFIG(*args, **kwargs)
+
+plt.savefig = _tracked_savefig
+
+def load_input_data():
+    return _INPUT_DATA
+
+def save_output(data, filename="output.json"):
+    with open(filename, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+    _GENERATED_FILES.append(filename)
+    return filename
+
+def list_files(pattern="*"):
+    from pathlib import Path
+    return list(Path(".").glob(pattern))
+
+try:
+{indented_code}
+except Exception as e:
+    print(f"Error: {{e}}", file=sys.stderr)
+    raise
+
+print(f"\\n__GENERATED_FILES__: {{json.dumps(_GENERATED_FILES)}}")
+'''
+        return wrapper
     
     async def execute(
         self,
         code: str,
         session_id: str = "default",
-        input_data: dict[str, Any] | None = None,
+        input_data: dict | None = None,
         validate: bool = True,
-        on_progress: Callable[[str], None] | None = None,
     ) -> ExecutionResult:
         """
-        Execute Python code asynchronously.
+        Execute Python code.
         
         Args:
             code: Python code to execute
-            session_id: Session identifier for working directory
-            input_data: Optional dict to pass to code via pickle
-            validate: Whether to validate code before execution
-            on_progress: Optional callback for progress updates
+            session_id: Session ID for file persistence
+            input_data: Optional input data dict
+            validate: Whether to validate code first
         
         Returns:
-            ExecutionResult with outputs and artifacts
+            ExecutionResult with outputs
         """
         start_time = datetime.now()
-        working_dir = self._get_working_dir(session_id)
         
         # Validate code
         if validate:
@@ -253,133 +350,157 @@ print(f"Loaded input data: {{list(__INPUT__.keys())}}")
             if not is_valid:
                 return ExecutionResult(
                     success=False,
-                    stdout="",
-                    stderr=msg,
                     error=msg,
-                    execution_time_seconds=0,
-                    working_dir=str(working_dir),
                 )
         
-        if on_progress:
-            on_progress("Preparing code execution...")
+        # Get session directory
+        session_dir = self._get_session_dir(session_id)
         
-        # Track files before
-        files_before = set(working_dir.rglob("*"))
+        # Generate wrapper code
+        wrapper_code = self._generate_wrapper_code(code, session_dir, input_data)
         
-        # Prepare code
-        prepared_code = self._prepare_code(code, working_dir, input_data)
-        
-        # Save to temp file
-        code_file = working_dir / f"_code_{datetime.now().strftime('%Y%m%d_%H%M%S')}.py"
-        code_file.write_text(prepared_code)
-        
-        if on_progress:
-            on_progress(f"Executing in {working_dir}...")
+        # Write to temp file
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".py",
+            delete=False,
+            dir=session_dir,
+        ) as f:
+            f.write(wrapper_code)
+            script_path = f.name
         
         try:
-            # Run in subprocess
+            # Execute in subprocess
             process = await asyncio.create_subprocess_exec(
                 sys.executable,
-                str(code_file),
+                script_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(working_dir),
+                cwd=str(session_dir),
             )
             
             try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=self.timeout_seconds,
+                    timeout=self.timeout,
                 )
-                
-                stdout = self._truncate_output(stdout_bytes.decode('utf-8', errors='replace'))
-                stderr = self._truncate_output(stderr_bytes.decode('utf-8', errors='replace'))
-                success = process.returncode == 0
-                error = None if success else f"Exit code: {process.returncode}"
-                
             except asyncio.TimeoutError:
                 process.kill()
-                await process.wait()
-                stdout = ""
-                stderr = ""
-                success = False
-                error = f"Timeout after {self.timeout_seconds}s"
+                return ExecutionResult(
+                    success=False,
+                    error=f"Execution timed out after {self.timeout}s",
+                    execution_time=(datetime.now() - start_time).total_seconds(),
+                )
             
-            # Track new files
-            files_after = set(working_dir.rglob("*"))
-            generated_files = [
-                str(f.relative_to(working_dir))
-                for f in (files_after - files_before)
-                if f.is_file() and not f.name.startswith('_')
-            ]
+            stdout_str = stdout.decode("utf-8", errors="replace")
+            stderr_str = stderr.decode("utf-8", errors="replace")
             
-            execution_time = (datetime.now() - start_time).total_seconds()
+            # Parse generated files
+            generated_files = []
+            plots = []
             
-            result = ExecutionResult(
-                success=success,
-                stdout=stdout,
-                stderr=stderr,
-                error=error,
-                execution_time_seconds=execution_time,
-                generated_files=generated_files,
-                working_dir=str(working_dir),
-            )
+            if "__GENERATED_FILES__:" in stdout_str:
+                parts = stdout_str.split("__GENERATED_FILES__:")
+                stdout_str = parts[0].strip()
+                try:
+                    files_json = parts[1].strip()
+                    generated_files = json.loads(files_json)
+                    
+                    # Separate plots
+                    for f in generated_files:
+                        if f.endswith((".png", ".jpg", ".jpeg", ".svg", ".pdf")):
+                            plots.append(str(session_dir / f))
+                        else:
+                            generated_files.append(str(session_dir / f))
+                except:
+                    pass
             
-            if on_progress:
-                status = "✅ Success" if success else f"❌ Failed: {error}"
-                on_progress(f"{status} ({execution_time:.2f}s)")
+            # Check for actual files in directory
+            for f in session_dir.glob("*"):
+                if f.is_file() and not f.name.startswith("_"):
+                    if f.suffix in [".png", ".jpg", ".svg", ".pdf"]:
+                        if str(f) not in plots:
+                            plots.append(str(f))
+                    elif f.suffix in [".csv", ".json", ".parquet"]:
+                        if str(f) not in generated_files:
+                            generated_files.append(str(f))
             
-            logger.info(f"Execution {'succeeded' if success else 'failed'}: {execution_time:.2f}s")
-            return result
+            success = process.returncode == 0
             
-        except Exception as e:
-            execution_time = (datetime.now() - start_time).total_seconds()
-            logger.error(f"Execution error: {e}")
             return ExecutionResult(
-                success=False,
-                stdout="",
-                stderr=str(e),
-                error=f"Exception: {e}",
-                execution_time_seconds=execution_time,
-                working_dir=str(working_dir),
+                success=success,
+                stdout=stdout_str,
+                stderr=stderr_str,
+                error=stderr_str if not success else None,
+                execution_time=(datetime.now() - start_time).total_seconds(),
+                generated_files=generated_files,
+                plots=plots,
             )
+        
+        finally:
+            # Cleanup temp script
+            try:
+                Path(script_path).unlink()
+            except:
+                pass
     
     def execute_sync(
         self,
         code: str,
         session_id: str = "default",
-        input_data: dict[str, Any] | None = None,
+        input_data: dict | None = None,
     ) -> ExecutionResult:
-        """Synchronous wrapper for execute()."""
+        """Synchronous code execution."""
         return asyncio.run(self.execute(code, session_id, input_data))
     
     def get_session_files(self, session_id: str) -> list[Path]:
-        """Get all files in a session's working directory."""
-        working_dir = self._get_working_dir(session_id)
-        return [f for f in working_dir.rglob("*") if f.is_file() and not f.name.startswith('_')]
+        """Get all files in session directory."""
+        session_dir = self._get_session_dir(session_id)
+        return [f for f in session_dir.rglob("*") if f.is_file()]
     
     def read_session_file(self, session_id: str, filename: str) -> bytes | None:
-        """Read a file from a session's working directory."""
-        working_dir = self._get_working_dir(session_id)
-        file_path = working_dir / filename
+        """Read a file from session directory."""
+        session_dir = self._get_session_dir(session_id)
+        file_path = session_dir / filename
         if file_path.exists():
             return file_path.read_bytes()
         return None
     
     def cleanup_session(self, session_id: str):
-        """Clean up a session's working directory."""
+        """Clean up session directory."""
         import shutil
-        working_dir = self._get_working_dir(session_id)
-        if working_dir.exists():
-            shutil.rmtree(working_dir)
+        
+        if session_id in self._sessions:
+            session_dir = self._sessions[session_id]
+            if session_dir.exists():
+                shutil.rmtree(session_dir, ignore_errors=True)
+            del self._sessions[session_id]
             logger.info(f"Cleaned up session: {session_id}")
+    
+    def copy_file_to_session(
+        self,
+        session_id: str,
+        source_path: str | Path,
+        dest_name: str | None = None,
+    ) -> Path:
+        """Copy a file into session directory."""
+        import shutil
+        
+        session_dir = self._get_session_dir(session_id)
+        source = Path(source_path)
+        dest_name = dest_name or source.name
+        dest = session_dir / dest_name
+        
+        shutil.copy2(source, dest)
+        logger.debug(f"Copied {source} to {dest}")
+        return dest
 
 
 # =============================================================================
-# LangChain Tool Integration
+# LangChain Tool
 # =============================================================================
 
-def create_code_execution_tool(executor: LocalCodeExecutor):
+def create_code_execution_tool(executor: CodeExecutor):
     """Create a LangChain tool for code execution."""
     from langchain_core.tools import tool
     
@@ -393,12 +514,12 @@ def create_code_execution_tool(executor: LocalCodeExecutor):
         
         Use this tool to:
         - Load and analyze CSV/Excel data
-        - Create visualizations
+        - Create visualizations (plots are saved to files)
         - Perform statistical analysis
         - Process data for MMM
         
-        The code runs in an isolated environment with pandas, numpy,
-        matplotlib, seaborn, scipy, statsmodels, and sklearn available.
+        Available libraries: pandas, numpy, matplotlib, seaborn,
+        scipy, statsmodels, sklearn, pymc, arviz
         
         Args:
             code: Python code to execute
@@ -414,21 +535,20 @@ def create_code_execution_tool(executor: LocalCodeExecutor):
 
 
 # =============================================================================
-# Factory
+# Singleton Factory
 # =============================================================================
 
-_executor_instance: LocalCodeExecutor | None = None
+_executor: CodeExecutor | None = None
 
 
-def get_executor(
-    timeout_seconds: int = 300,
-    working_dir: Path | None = None,
-) -> LocalCodeExecutor:
-    """Get or create the global code executor instance."""
-    global _executor_instance
-    if _executor_instance is None:
-        _executor_instance = LocalCodeExecutor(
-            timeout_seconds=timeout_seconds,
-            working_dir=working_dir,
+def get_code_executor(settings: Settings | None = None) -> CodeExecutor:
+    """Get or create singleton code executor."""
+    global _executor
+    if _executor is None:
+        settings = settings or get_settings()
+        _executor = CodeExecutor(
+            timeout_seconds=settings.code_execution_timeout,
+            working_dir=settings.code_working_dir,
+            settings=settings,
         )
-    return _executor_instance
+    return _executor

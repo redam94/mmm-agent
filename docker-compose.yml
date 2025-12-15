@@ -1,0 +1,128 @@
+version: "3.9"
+
+services:
+  # Neo4j Graph Database
+  neo4j:
+    image: neo4j:5.15-community
+    container_name: mmm-neo4j
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/mmmpassword
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_apoc_import_file_use__neo4j__config: "true"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL for LangGraph Checkpointing
+  postgres:
+    image: postgres:15-alpine
+    container_name: mmm-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: mmm
+      POSTGRES_PASSWORD: mmmpassword
+      POSTGRES_DB: mmm_workflows
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mmm -d mmm_workflows"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for Pub/Sub (Progress Streaming)
+  redis:
+    image: redis:7-alpine
+    container_name: mmm-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Ollama LLM Server
+  ollama:
+    image: ollama/ollama:latest
+    container_name: mmm-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Uncomment for CPU-only:
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 32G
+
+  # ChromaDB Vector Database
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: mmm-chromadb
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      ANONYMIZED_TELEMETRY: "false"
+
+  # MMM Workflows API
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mmm-api
+    ports:
+      - "8000:8000"
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: mmmpassword
+      DATABASE_URL: postgresql://mmm:mmmpassword@postgres:5432/mmm_workflows
+      ASYNC_DATABASE_URL: postgresql+asyncpg://mmm:mmmpassword@postgres:5432/mmm_workflows
+      REDIS_URL: redis://redis:6379
+      OLLAMA_BASE_URL: http://ollama:11434
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["uvicorn", "mmm_workflows.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  neo4j_data:
+  postgres_data:
+  redis_data:
+  ollama_data:
+  chroma_data:
+
+networks:
+  default:
+    name: mmm-network

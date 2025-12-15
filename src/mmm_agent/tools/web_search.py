@@ -1,343 +1,448 @@
 """
-Web Search Tool for MMM Agent
+Web Search Tools for MMM Research Agent
 
-Provides web search capabilities for research during planning and interpretation.
-Uses DuckDuckGo for simplicity (no API key required).
+Provides:
+- DuckDuckGo search integration
+- Optional crawl4ai for deep content extraction
+- LLM-powered query optimization
+- Result synthesis
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
 from loguru import logger
 from pydantic import BaseModel, Field
 
+# Check for optional dependencies
+try:
+    from duckduckgo_search import DDGS
+    DDGS_AVAILABLE = True
+except ImportError:
+    DDGS_AVAILABLE = False
+    logger.warning("DuckDuckGo search not available")
 
-@dataclass
-class SearchResult:
+try:
+    from crawl4ai import AsyncWebCrawler
+    CRAWL4AI_AVAILABLE = True
+except ImportError:
+    CRAWL4AI_AVAILABLE = False
+    logger.debug("crawl4ai not available - using basic search")
+
+
+# =============================================================================
+# Models
+# =============================================================================
+
+class SearchResult(BaseModel):
     """A web search result."""
     title: str
     url: str
-    snippet: str
-    source: str = ""
+    content: str  # Snippet or full content
+    score: float = 0.5
+    source: str = "duckduckgo"
+    query_used: str | None = None
+    crawled: bool = False
 
 
-class WebSearcher:
-    """
-    Web search using DuckDuckGo.
-    
-    For production, consider using:
-    - Tavily API (better for AI agents)
-    - SerpAPI (Google results)
-    - Bing Search API
-    """
-    
-    def __init__(self, max_results: int = 10):
-        self.max_results = max_results
-    
-    async def search(
-        self,
-        query: str,
-        max_results: int | None = None,
-        on_progress: Callable[[str], None] | None = None,
-    ) -> list[SearchResult]:
-        """
-        Search the web.
-        
-        Args:
-            query: Search query
-            max_results: Maximum results to return
-            on_progress: Optional progress callback
-        
-        Returns:
-            List of search results
-        """
-        max_results = max_results or self.max_results
-        
-        if on_progress:
-            on_progress(f"Searching: {query}")
-        
-        try:
-            from duckduckgo_search import DDGS
-            
-            results = []
-            
-            with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=max_results):
-                    results.append(SearchResult(
-                        title=r.get("title", ""),
-                        url=r.get("href", ""),
-                        snippet=r.get("body", ""),
-                        source="duckduckgo",
-                    ))
-            
-            if on_progress:
-                on_progress(f"Found {len(results)} results")
-            
-            logger.info(f"Web search '{query}': {len(results)} results")
-            return results
-            
-        except ImportError:
-            logger.warning("duckduckgo_search not installed, using mock results")
-            return self._mock_search(query)
-        except Exception as e:
-            logger.error(f"Search failed: {e}")
-            return []
-    
-    def search_sync(self, query: str, max_results: int | None = None) -> list[SearchResult]:
-        """Synchronous search wrapper."""
-        return asyncio.run(self.search(query, max_results))
-    
-    def _mock_search(self, query: str) -> list[SearchResult]:
-        """Return mock results for testing."""
-        return [
-            SearchResult(
-                title=f"Mock Result for: {query}",
-                url="https://example.com",
-                snippet="This is a mock search result for testing purposes.",
-                source="mock",
-            )
-        ]
+class SearchQueries(BaseModel):
+    """Generated search queries."""
+    queries: list[str] = Field(description="Search queries to execute")
+    reasoning: str = Field(description="Why these queries were chosen")
+
+
+class SearchSynthesis(BaseModel):
+    """Synthesized search results."""
+    summary: str = Field(description="Concise summary of findings")
+    key_insights: list[str] = Field(description="Key insights from search")
+    relevance_score: float = Field(description="Relevance to original query (0-1)")
+    sources_used: int = 0
+
+
+class WebSearchContext(BaseModel):
+    """Complete search context."""
+    query: str
+    results: list[SearchResult] = Field(default_factory=list)
+    queries_used: list[str] = Field(default_factory=list)
+    synthesis: SearchSynthesis | None = None
+    error: str | None = None
 
 
 # =============================================================================
-# Research Query Generator
+# DuckDuckGo Search
 # =============================================================================
 
-class ResearchQueries(BaseModel):
-    """Generated research queries."""
-    queries: list[str] = Field(description="List of search queries")
-    reasoning: str = Field(description="Why these queries")
-
-
-def generate_research_queries(
-    user_query: str,
-    phase: str,
-    context: str = "",
-    llm = None,
-) -> list[str]:
+async def search_duckduckgo(
+    query: str,
+    max_results: int = 5,
+    region: str = "wt-wt",
+) -> list[SearchResult]:
     """
-    Generate research queries for a given user question.
+    Search DuckDuckGo for results.
     
-    Uses LLM to create targeted search queries based on:
-    - The user's question
-    - The current workflow phase
-    - Available context
+    Args:
+        query: Search query
+        max_results: Maximum results to return
+        region: Search region
+    
+    Returns:
+        List of search results
     """
-    if llm is None:
-        # Default queries based on phase
-        phase_queries = {
-            "planning": [
-                f"{user_query} marketing mix model",
-                f"{user_query} media effectiveness measurement",
-                f"MMM variable selection {user_query}",
-            ],
-            "eda": [
-                f"{user_query} data quality checks",
-                f"feature engineering {user_query}",
-            ],
-            "modeling": [
-                f"bayesian MMM {user_query}",
-                f"pymc marketing {user_query}",
-            ],
-            "interpretation": [
-                f"marketing ROI interpretation {user_query}",
-                f"media budget optimization {user_query}",
-            ],
-        }
-        return phase_queries.get(phase, [user_query])[:3]
+    if not DDGS_AVAILABLE:
+        logger.warning("DuckDuckGo not available")
+        return []
     
-    # Use LLM to generate queries
-    from langchain_core.messages import HumanMessage, SystemMessage
+    results = []
     
-    prompt = f"""Generate 2-4 web search queries to research this marketing analytics question.
-
-User Question: {user_query}
-
-Workflow Phase: {phase}
-
-Context:
-{context[:500]}
-
-Focus queries on:
-- Planning: Variable selection, confounders, data requirements
-- EDA: Data quality, feature engineering, transformations
-- Modeling: Bayesian methods, model specification
-- Interpretation: ROI calculation, optimization, recommendations
-
-Return queries as a numbered list."""
-
     try:
-        structured_llm = llm.with_structured_output(ResearchQueries)
-        result = structured_llm.invoke([
-            SystemMessage(content="Generate targeted web search queries for marketing analytics research."),
-            HumanMessage(content=prompt),
-        ])
-        return result.queries
+        # Run sync search in thread pool
+        def _search():
+            with DDGS() as ddgs:
+                return list(ddgs.text(
+                    query,
+                    region=region,
+                    max_results=max_results,
+                ))
+        
+        loop = asyncio.get_event_loop()
+        raw_results = await loop.run_in_executor(None, _search)
+        
+        for r in raw_results:
+            results.append(SearchResult(
+                title=r.get("title", ""),
+                url=r.get("href", r.get("link", "")),
+                content=r.get("body", r.get("snippet", "")),
+                source="duckduckgo",
+                query_used=query,
+            ))
+        
+        logger.debug(f"DuckDuckGo search '{query}': {len(results)} results")
+        
     except Exception as e:
-        logger.warning(f"Query generation failed: {e}")
-        return [user_query]
+        logger.error(f"DuckDuckGo search failed: {e}")
+    
+    return results
 
 
 # =============================================================================
-# Research Tool
+# URL Crawling
 # =============================================================================
 
-class ResearchTool:
+async def crawl_url(
+    url: str,
+    query: str | None = None,
+    max_chars: int = 5000,
+) -> SearchResult | None:
     """
-    Combines query generation and web search for research.
+    Crawl a URL for full content using crawl4ai.
+    
+    Args:
+        url: URL to crawl
+        query: Original query for context
+        max_chars: Maximum content characters
+    
+    Returns:
+        SearchResult with crawled content or None
+    """
+    if not CRAWL4AI_AVAILABLE:
+        return None
+    
+    try:
+        async with AsyncWebCrawler(verbose=False) as crawler:
+            result = await crawler.arun(
+                url=url,
+                word_count_threshold=50,
+                excluded_tags=["nav", "footer", "header", "aside"],
+            )
+            
+            if result and result.markdown:
+                content = result.markdown[:max_chars]
+                return SearchResult(
+                    title=result.metadata.get("title", url),
+                    url=url,
+                    content=content,
+                    source="crawl4ai",
+                    query_used=query,
+                    crawled=True,
+                )
+    
+    except Exception as e:
+        logger.warning(f"Failed to crawl {url}: {e}")
+    
+    return None
+
+
+# =============================================================================
+# Search Agent with LLM
+# =============================================================================
+
+class SearchAgent:
+    """
+    Intelligent web search agent using LLM for query optimization.
+    
+    Features:
+    - LLM-generated search queries
+    - Iterative refinement based on results
+    - Optional deep crawling of top results
+    - Result synthesis
     """
     
     def __init__(
         self,
-        searcher: WebSearcher | None = None,
-        llm = None,
+        llm=None,
+        max_iterations: int = 2,
+        results_per_query: int = 3,
+        enable_crawl: bool = True,
+        max_crawl_urls: int = 3,
     ):
-        self.searcher = searcher or WebSearcher()
         self.llm = llm
+        self.max_iterations = max_iterations
+        self.results_per_query = results_per_query
+        self.enable_crawl = enable_crawl and CRAWL4AI_AVAILABLE
+        self.max_crawl_urls = max_crawl_urls
     
-    async def research(
+    async def generate_queries(
         self,
-        question: str,
-        phase: str,
+        user_query: str,
         context: str = "",
-        max_results_per_query: int = 5,
         on_progress: Callable[[str], None] | None = None,
-    ) -> list[dict]:
+    ) -> SearchQueries:
+        """Generate optimized search queries."""
+        if not self.llm:
+            # Fallback without LLM
+            return SearchQueries(
+                queries=[
+                    f"{user_query} marketing mix model",
+                    f"{user_query} MMM best practices",
+                ],
+                reasoning="Using default query patterns (LLM not available)"
+            )
+        
+        if on_progress:
+            on_progress("🧠 Generating search queries...")
+        
+        try:
+            from langchain_core.messages import HumanMessage, SystemMessage
+            
+            structured_llm = self.llm.with_structured_output(SearchQueries)
+            
+            prompt = f"""Generate 2-4 optimized web search queries for MMM research.
+
+User's Question: {user_query}
+
+Context:
+{context[:500] if context else "None provided"}
+
+Guidelines:
+- Create specific, targeted queries
+- Include relevant technical terms
+- One query should be broad, others more specific
+- Focus on Marketing Mix Modeling, attribution, media effectiveness
+"""
+            
+            result = structured_llm.invoke([
+                SystemMessage(content="Generate effective web search queries for marketing analytics research."),
+                HumanMessage(content=prompt)
+            ])
+            
+            if on_progress:
+                on_progress(f"📝 Generated {len(result.queries)} queries")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Query generation failed: {e}")
+            return SearchQueries(
+                queries=[user_query],
+                reasoning=f"Fallback due to error: {str(e)[:100]}"
+            )
+    
+    async def synthesize_results(
+        self,
+        query: str,
+        results: list[SearchResult],
+        on_progress: Callable[[str], None] | None = None,
+    ) -> SearchSynthesis:
+        """Synthesize search results into insights."""
+        if not self.llm or not results:
+            return SearchSynthesis(
+                summary="No results to synthesize",
+                key_insights=[],
+                relevance_score=0.0,
+                sources_used=0,
+            )
+        
+        if on_progress:
+            on_progress("✨ Synthesizing results...")
+        
+        try:
+            from langchain_core.messages import HumanMessage, SystemMessage
+            
+            structured_llm = self.llm.with_structured_output(SearchSynthesis)
+            
+            results_text = "\n\n".join([
+                f"[{r.title}]\n{r.content[:500]}..."
+                for r in results[:10]
+            ])
+            
+            prompt = f"""Synthesize these search results for the query: {query}
+
+Results:
+{results_text}
+
+Provide:
+1. A concise summary of key findings
+2. 3-5 actionable insights for MMM analysis
+3. Relevance score (0-1) for how well results answer the query
+"""
+            
+            result = structured_llm.invoke([
+                SystemMessage(content="Synthesize web research into actionable marketing analytics insights."),
+                HumanMessage(content=prompt)
+            ])
+            result.sources_used = len(results)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Synthesis failed: {e}")
+            return SearchSynthesis(
+                summary=f"Error during synthesis: {str(e)[:100]}",
+                key_insights=[],
+                relevance_score=0.0,
+                sources_used=len(results),
+            )
+    
+    async def search(
+        self,
+        query: str,
+        context: str = "",
+        on_progress: Callable[[str], None] | None = None,
+    ) -> WebSearchContext:
         """
-        Conduct research on a question.
+        Perform intelligent web search.
         
         Args:
-            question: Research question
-            phase: Workflow phase
+            query: User's research question
             context: Additional context
-            max_results_per_query: Results per query
             on_progress: Progress callback
         
         Returns:
-            List of search results as dicts
+            WebSearchContext with results and synthesis
         """
-        # Generate queries
-        queries = generate_research_queries(question, phase, context, self.llm)
+        ctx = WebSearchContext(query=query)
         
-        if on_progress:
-            on_progress(f"Generated {len(queries)} research queries")
-        
-        # Search each query
-        all_results = []
-        seen_urls = set()
-        
-        for query in queries:
-            results = await self.searcher.search(query, max_results_per_query, on_progress)
+        try:
+            # Generate queries
+            search_queries = await self.generate_queries(query, context, on_progress)
+            ctx.queries_used = search_queries.queries
             
-            for r in results:
+            # Execute searches
+            if on_progress:
+                on_progress(f"🔍 Executing {len(search_queries.queries)} searches...")
+            
+            for q in search_queries.queries:
+                results = await search_duckduckgo(q, max_results=self.results_per_query)
+                ctx.results.extend(results)
+            
+            # Deduplicate by URL
+            seen_urls = set()
+            unique_results = []
+            for r in ctx.results:
                 if r.url not in seen_urls:
-                    all_results.append({
-                        "title": r.title,
-                        "url": r.url,
-                        "snippet": r.snippet,
-                        "query": query,
-                    })
                     seen_urls.add(r.url)
+                    unique_results.append(r)
+            ctx.results = unique_results
+            
+            if on_progress:
+                on_progress(f"📄 Found {len(ctx.results)} unique results")
+            
+            # Crawl top results for more content
+            if self.enable_crawl and ctx.results:
+                if on_progress:
+                    on_progress(f"🕷️ Crawling top {self.max_crawl_urls} results...")
+                
+                for i, result in enumerate(ctx.results[:self.max_crawl_urls]):
+                    crawled = await crawl_url(result.url, query)
+                    if crawled and len(crawled.content) > len(result.content):
+                        ctx.results[i] = crawled
+                        if on_progress:
+                            on_progress(f"   ✅ Enriched: {result.title[:40]}")
+            
+            # Synthesize
+            ctx.synthesis = await self.synthesize_results(query, ctx.results, on_progress)
+            
+            if on_progress:
+                on_progress("✅ Search complete")
         
-        if on_progress:
-            on_progress(f"Found {len(all_results)} unique results")
+        except Exception as e:
+            logger.error(f"Search failed: {e}")
+            ctx.error = str(e)
         
-        return all_results
-    
-    def research_sync(
-        self,
-        question: str,
-        phase: str,
-        context: str = "",
-    ) -> list[dict]:
-        """Synchronous research wrapper."""
-        return asyncio.run(self.research(question, phase, context))
+        return ctx
 
 
 # =============================================================================
-# LangChain Tool Integration
+# Convenience Functions
 # =============================================================================
 
-def create_web_search_tool(searcher: WebSearcher | None = None):
-    """Create a LangChain tool for web search."""
-    from langchain_core.tools import tool
+async def quick_search(
+    query: str,
+    max_results: int = 5,
+) -> list[SearchResult]:
+    """Quick DuckDuckGo search without LLM."""
+    return await search_duckduckgo(query, max_results)
+
+
+async def research_topic(
+    query: str,
+    llm=None,
+    context: str = "",
+    on_progress: Callable[[str], None] | None = None,
+) -> WebSearchContext:
+    """
+    Research a topic with intelligent search.
     
-    searcher = searcher or WebSearcher()
+    Args:
+        query: Research question
+        llm: Optional LLM for query optimization
+        context: Additional context
+        on_progress: Progress callback
     
-    @tool
-    async def web_search(query: str, max_results: int = 5) -> list[dict]:
-        """
-        Search the web for information.
-        
-        Use this tool to find:
-        - Industry best practices
-        - Technical documentation
-        - Research papers and articles
-        - Case studies
-        
-        Args:
-            query: Search query (be specific)
-            max_results: Number of results (default 5)
-        
-        Returns:
-            List of search results with title, url, and snippet
-        """
-        results = await searcher.search(query, max_results)
-        return [
-            {
-                "title": r.title,
-                "url": r.url,
-                "snippet": r.snippet,
-            }
-            for r in results
-        ]
+    Returns:
+        WebSearchContext with synthesized results
+    """
+    agent = SearchAgent(
+        llm=llm,
+        max_iterations=2,
+        results_per_query=3,
+        enable_crawl=True,
+    )
+    return await agent.search(query, context, on_progress)
+
+
+def format_search_results(
+    results: list[SearchResult],
+    max_chars: int = 3000,
+) -> str:
+    """Format search results for LLM context."""
+    if not results:
+        return "No search results found."
     
-    return web_search
-
-
-def create_research_tool(llm = None):
-    """Create a LangChain tool for comprehensive research."""
-    from langchain_core.tools import tool
+    parts = ["=== Web Search Results ===\n"]
+    total_len = len(parts[0])
     
-    research_tool = ResearchTool(llm=llm)
+    for i, r in enumerate(results, 1):
+        entry = f"\n[{i}] {r.title}\nURL: {r.url}\n{r.content[:400]}...\n"
+        
+        if total_len + len(entry) > max_chars:
+            parts.append(f"\n... and {len(results) - i + 1} more results")
+            break
+        
+        parts.append(entry)
+        total_len += len(entry)
     
-    @tool
-    async def conduct_research(
-        question: str,
-        phase: str = "planning",
-        context: str = "",
-    ) -> list[dict]:
-        """
-        Conduct research on a marketing analytics question.
-        
-        This tool generates multiple search queries and aggregates results.
-        
-        Args:
-            question: Research question
-            phase: Workflow phase (planning, eda, modeling, interpretation)
-            context: Additional context
-        
-        Returns:
-            List of research results with deduplication
-        """
-        return await research_tool.research(question, phase, context)
-    
-    return conduct_research
-
-
-# =============================================================================
-# Factory
-# =============================================================================
-
-_searcher: WebSearcher | None = None
-
-
-def get_web_searcher() -> WebSearcher:
-    """Get or create global web searcher."""
-    global _searcher
-    if _searcher is None:
-        _searcher = WebSearcher()
-    return _searcher
+    return "".join(parts)
